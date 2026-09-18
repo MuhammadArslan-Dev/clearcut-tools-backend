@@ -1,0 +1,6 @@
+[variables]
+# The PHP provider embeds Node.js for the asset build step (npm run build).
+# Its default (18.x) is too old for vite@7 / @tailwindcss/oxide@4 /
+# laravel-vite-plugin@2, which all require Node >=20 — pin it explicitly
+# rather than relying solely on package.json's "engines.node" field.
+NIXPACKS_NODE_VERSION = "20"
