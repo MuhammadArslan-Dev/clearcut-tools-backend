@@ -26,6 +26,15 @@ use Illuminate\Support\Facades\DB;
  * only), this app's `exam_translations.locale` column has no such
  * restriction, so every locale present in the source (including e.g.
  * "mr"/"pun") is synced as its own row.
+ *
+ * Batched via `Model::upsert()` rather than one `updateOrCreate()` per
+ * exam/locale — the DB here is a remote server shared with production
+ * traffic, so a per-row round trip (measured ~700-800ms under load, well
+ * above bare ping) turned a few hundred exam×locale combinations into a
+ * sync taking 10+ minutes. Two bulk upserts (exams, then translations
+ * once exam ids are known) plus two small existing-row lookups for
+ * created/updated stats keeps this to a handful of queries regardless of
+ * row count.
  */
 class BigQueryExamSyncService
 {
@@ -45,47 +54,95 @@ class BigQueryExamSyncService
     {
         $this->warnings = [];
         $rows = $this->client->runQuery(self::QUERY);
-        $stats = ['created' => 0, 'updated' => 0, 'skipped' => 0];
 
-        DB::transaction(function () use ($rows, &$stats) {
-            foreach ($rows as $i => $row) {
-                $slug = $row['exam_slug'] ?? null;
+        // Keyed by slug so a slug repeated in the source (shouldn't happen,
+        // but the old per-row loop silently tolerated it) collapses to one
+        // upsert row instead of erroring on a duplicate ON CONFLICT target.
+        $examsBySlug = [];
 
-                if (! $slug) {
-                    $this->warn($i, 'missing exam_slug — row columns: '.implode(', ', array_keys($row)));
-                    $stats['skipped']++;
+        foreach ($rows as $i => $row) {
+            $slug = $row['exam_slug'] ?? null;
 
-                    continue;
-                }
+            if (! $slug) {
+                $this->warn($i, 'missing exam_slug — row columns: '.implode(', ', array_keys($row)));
 
-                $shortName = $row['short_name'] ?? $slug;
-                $fullNameByLocale = $this->decodeLocaleMap($row['full_name'] ?? null);
-                $conductingBodyByLocale = $this->decodeLocaleMap($row['conducting_body'] ?? null);
+                continue;
+            }
 
-                if (empty($fullNameByLocale)) {
-                    // full_name didn't decode into a locale map (missing, or a
-                    // plain unlocalized string) — fall back to a single "en"
-                    // row rather than skipping the exam entirely.
-                    $fullNameByLocale = ['en' => ['name' => $row['full_name'] ?? $shortName]];
-                }
+            $shortName = $row['short_name'] ?? $slug;
+            $fullNameByLocale = $this->decodeLocaleMap($row['full_name'] ?? null);
+            $conductingBodyByLocale = $this->decodeLocaleMap($row['conducting_body'] ?? null);
 
-                $exam = Exam::updateOrCreate(['exam_slug' => $slug], []);
+            if (empty($fullNameByLocale)) {
+                // full_name didn't decode into a locale map (missing, or a
+                // plain unlocalized string) — fall back to a single "en"
+                // row rather than skipping the exam entirely.
+                $fullNameByLocale = ['en' => ['name' => $row['full_name'] ?? $shortName]];
+            }
 
-                foreach ($fullNameByLocale as $locale => $fullNameEntry) {
-                    $translation = ExamTranslation::updateOrCreate(
-                        ['exam_id' => $exam->id, 'locale' => $locale],
-                        [
-                            'short_name' => $shortName,
-                            'full_name' => $fullNameEntry['name'] ?? $shortName,
-                            'conducting_body' => $conductingBodyByLocale[$locale]['name']
-                                ?? $conductingBodyByLocale['en']['name']
-                                ?? null,
-                        ],
-                    );
+            $examsBySlug[$slug] = [
+                'short_name' => $shortName,
+                'full_name_by_locale' => $fullNameByLocale,
+                'conducting_body_by_locale' => $conductingBodyByLocale,
+            ];
+        }
 
-                    $stats[$translation->wasRecentlyCreated ? 'created' : 'updated']++;
+        $stats = ['created' => 0, 'updated' => 0, 'skipped' => count($rows) - count($examsBySlug)];
+
+        if (empty($examsBySlug)) {
+            return ['stats' => $stats, 'warnings' => $this->warnings];
+        }
+
+        DB::transaction(function () use ($examsBySlug, &$stats) {
+            $now = now();
+            $slugs = array_keys($examsBySlug);
+
+            Exam::query()->upsert(
+                array_map(fn (string $slug) => [
+                    'exam_slug' => $slug,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ], $slugs),
+                ['exam_slug'],
+                ['updated_at'],
+            );
+
+            $examIdsBySlug = Exam::whereIn('exam_slug', $slugs)->pluck('id', 'exam_slug');
+
+            $translationRows = [];
+
+            foreach ($examsBySlug as $slug => $exam) {
+                $examId = $examIdsBySlug[$slug];
+
+                foreach ($exam['full_name_by_locale'] as $locale => $fullNameEntry) {
+                    $translationRows[] = [
+                        'exam_id' => $examId,
+                        'locale' => $locale,
+                        'short_name' => $exam['short_name'],
+                        'full_name' => $fullNameEntry['name'] ?? $exam['short_name'],
+                        'conducting_body' => $exam['conducting_body_by_locale'][$locale]['name']
+                            ?? $exam['conducting_body_by_locale']['en']['name']
+                            ?? null,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
                 }
             }
+
+            $existingPairs = ExamTranslation::whereIn('exam_id', $examIdsBySlug->values())
+                ->get(['exam_id', 'locale'])
+                ->map(fn ($t) => $t->exam_id.'|'.$t->locale)
+                ->flip();
+
+            foreach ($translationRows as $row) {
+                $stats[$existingPairs->has($row['exam_id'].'|'.$row['locale']) ? 'updated' : 'created']++;
+            }
+
+            ExamTranslation::query()->upsert(
+                $translationRows,
+                ['exam_id', 'locale'],
+                ['short_name', 'full_name', 'conducting_body', 'updated_at'],
+            );
         });
 
         return [

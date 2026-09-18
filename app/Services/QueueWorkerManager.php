@@ -53,6 +53,31 @@ class QueueWorkerManager
 
     public function status(): array
     {
+        if (PHP_OS_FAMILY === 'Windows') {
+            // Trust the process list over the pid file: the pid file only
+            // records what *this app* started, so a worker launched by
+            // hand in a separate terminal (or left over from a crashed
+            // run) would otherwise go undetected and "Start" would spawn
+            // a second one — the exact double-worker deadlock this
+            // project hit against the `exams` table (see
+            // RunBigQuerySyncJob::middleware()). Any queue:work process
+            // counts, tracked by us or not.
+            $running = $this->queueWorkerPids();
+
+            if (empty($running)) {
+                @unlink($this->pidFile);
+
+                return ['running' => false, 'pid' => null];
+            }
+
+            $tracked = $this->readPid();
+            $pid = ($tracked !== null && in_array((string) $tracked, $running, true))
+                ? $tracked
+                : (int) $running[0];
+
+            return ['running' => true, 'pid' => $pid, 'extra' => count($running) > 1 ? count($running) - 1 : 0];
+        }
+
         $pid = $this->readPid();
 
         if ($pid === null) {

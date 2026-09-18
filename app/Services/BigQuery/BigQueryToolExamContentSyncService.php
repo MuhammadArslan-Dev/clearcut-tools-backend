@@ -30,6 +30,17 @@ use Illuminate\Support\Facades\DB;
  *   data_json                already a JSON string (photoSpec/signatureSpec/
  *                            officialRequirements) — stored as-is on
  *                            tool_exam_data, not per-locale
+ *
+ * Tool/exam/tool_exam lookups are preloaded into slug-keyed maps (3
+ * queries total) instead of a `where(...)->first()` chain per row, and
+ * both target tables are written with one `upsert()` call each instead
+ * of one `updateOrCreate()` per row/locale — see
+ * BigQueryExamSyncService's docblock for why. `data_json` is `jsonb`,
+ * and `upsert()` skips Eloquent's `array` cast (it writes raw column
+ * values, not hydrated models), so it's `json_encode()`d by hand here —
+ * passed as a plain bound string parameter, same as the cast itself
+ * would send; Postgres coerces a text parameter into a jsonb column via
+ * the column's own input function, no explicit `::jsonb` cast needed.
  */
 class BigQueryToolExamContentSyncService
 {
@@ -59,75 +70,117 @@ class BigQueryToolExamContentSyncService
         $rows = $this->client->runQuery(self::QUERY);
         $stats = ['created' => 0, 'updated' => 0, 'skipped' => 0];
 
-        DB::transaction(function () use ($rows, &$stats) {
-            foreach ($rows as $i => $row) {
-                $toolSlug = $row['tool_slug'] ?? null;
-                $examSlug = $row['exam_slug'] ?? null;
+        $toolIdsBySlug = Tool::pluck('id', 'tool_slug');
+        $examIdsBySlug = Exam::pluck('id', 'exam_slug');
+        $toolExamIdsByPair = ToolExam::get(['id', 'tool_id', 'exam_id'])
+            ->keyBy(fn ($te) => $te->tool_id.'|'.$te->exam_id);
 
-                if (! $toolSlug || ! $examSlug) {
-                    $this->warnings[] = "row {$i}: missing tool_slug or exam_slug";
-                    $stats['skipped']++;
+        $dataRows = []; // tool_exam_id => data_json array
+        $translationRows = []; // "tool_exam_id|locale" => row
 
+        foreach ($rows as $i => $row) {
+            $toolSlug = $row['tool_slug'] ?? null;
+            $examSlug = $row['exam_slug'] ?? null;
+
+            if (! $toolSlug || ! $examSlug) {
+                $this->warnings[] = "row {$i}: missing tool_slug or exam_slug";
+                $stats['skipped']++;
+
+                continue;
+            }
+
+            $toolId = $toolIdsBySlug[$toolSlug] ?? null;
+            $examId = $examIdsBySlug[$examSlug] ?? null;
+
+            if (! $toolId || ! $examId) {
+                $this->warnings[] = "row {$i}: tool_slug '{$toolSlug}' or exam_slug '{$examSlug}' not found — sync tools/exams first, row skipped";
+                $stats['skipped']++;
+
+                continue;
+            }
+
+            $toolExam = $toolExamIdsByPair->get($toolId.'|'.$examId);
+
+            if (! $toolExam) {
+                $this->warnings[] = "row {$i}: no tool_exam_mapping row for tool '{$toolSlug}' + exam '{$examSlug}' — sync tool_exam_mapping first, row skipped";
+                $stats['skipped']++;
+
+                continue;
+            }
+
+            $rawDataJson = $row['data_json'] ?? null;
+            $data = [];
+
+            if ($rawDataJson) {
+                $decoded = json_decode($rawDataJson, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                    $data = $decoded;
+                } else {
+                    $this->warnings[] = "row {$i}: data_json for tool '{$toolSlug}' + exam '{$examSlug}' is not valid JSON — saved as empty";
+                }
+            }
+
+            $dataRows[$toolExam->id] = $data;
+
+            $isPlaceholder = $this->normalizeBool($row['is_placeholder'] ?? null, false);
+
+            foreach (self::LOCALE_SUFFIXES as $suffix => $locale) {
+                $title = $row["seo_title_{$suffix}"] ?? null;
+                $description = $row["seo_description_{$suffix}"] ?? null;
+
+                if ($title === null && $description === null) {
                     continue;
                 }
 
-                $tool = Tool::where('tool_slug', $toolSlug)->first();
-                $exam = Exam::where('exam_slug', $examSlug)->first();
+                $translationRows[$toolExam->id.'|'.$locale] = [
+                    'tool_exam_id' => $toolExam->id,
+                    'locale' => $locale,
+                    'seo_title' => $title,
+                    'seo_description' => $description,
+                    'is_placeholder' => $isPlaceholder,
+                ];
+            }
+        }
 
-                if (! $tool || ! $exam) {
-                    $this->warnings[] = "row {$i}: tool_slug '{$toolSlug}' or exam_slug '{$examSlug}' not found — sync tools/exams first, row skipped";
-                    $stats['skipped']++;
+        if (empty($dataRows) && empty($translationRows)) {
+            return ['stats' => $stats, 'warnings' => $this->warnings];
+        }
 
-                    continue;
-                }
+        DB::transaction(function () use ($dataRows, $translationRows, &$stats) {
+            $now = now();
 
-                $toolExam = ToolExam::where('tool_id', $tool->id)->where('exam_id', $exam->id)->first();
-
-                if (! $toolExam) {
-                    $this->warnings[] = "row {$i}: no tool_exam_mapping row for tool '{$toolSlug}' + exam '{$examSlug}' — sync tool_exam_mapping first, row skipped";
-                    $stats['skipped']++;
-
-                    continue;
-                }
-
-                $rawDataJson = $row['data_json'] ?? null;
-                $data = [];
-
-                if ($rawDataJson) {
-                    $decoded = json_decode($rawDataJson, true);
-                    if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                        $data = $decoded;
-                    } else {
-                        $this->warnings[] = "row {$i}: data_json for tool '{$toolSlug}' + exam '{$examSlug}' is not valid JSON — saved as empty";
-                    }
-                }
-
-                ToolExamData::updateOrCreate(
-                    ['tool_exam_id' => $toolExam->id],
-                    ['data_json' => $data],
+            if (! empty($dataRows)) {
+                ToolExamData::query()->upsert(
+                    collect($dataRows)->map(fn ($data, $toolExamId) => [
+                        'tool_exam_id' => $toolExamId,
+                        'data_json' => json_encode($data),
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ])->values()->all(),
+                    ['tool_exam_id'],
+                    ['data_json', 'updated_at'],
                 );
+            }
 
-                $isPlaceholder = $this->normalizeBool($row['is_placeholder'] ?? null, false);
+            if (! empty($translationRows)) {
+                $existingPairs = ToolExamTranslation::query()
+                    ->get(['tool_exam_id', 'locale'])
+                    ->map(fn ($t) => $t->tool_exam_id.'|'.$t->locale)
+                    ->flip();
 
-                foreach (self::LOCALE_SUFFIXES as $suffix => $locale) {
-                    $title = $row["seo_title_{$suffix}"] ?? null;
-                    $description = $row["seo_description_{$suffix}"] ?? null;
+                $upsertRows = [];
 
-                    if ($title === null && $description === null) {
-                        continue;
-                    }
+                foreach ($translationRows as $key => $row) {
+                    $stats[$existingPairs->has($key) ? 'updated' : 'created']++;
 
-                    $translation = ToolExamTranslation::updateOrCreate(
-                        ['tool_exam_id' => $toolExam->id, 'locale' => $locale],
-                        [
-                            'seo_title' => $title,
-                            'seo_description' => $description,
-                            'is_placeholder' => $isPlaceholder,
-                        ],
-                    );
-
-                    $stats[$translation->wasRecentlyCreated ? 'created' : 'updated']++;
+                    $upsertRows[] = [...$row, 'created_at' => $now, 'updated_at' => $now];
                 }
+
+                ToolExamTranslation::query()->upsert(
+                    $upsertRows,
+                    ['tool_exam_id', 'locale'],
+                    ['seo_title', 'seo_description', 'is_placeholder', 'updated_at'],
+                );
             }
         });
 
