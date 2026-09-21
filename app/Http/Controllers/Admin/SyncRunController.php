@@ -16,7 +16,7 @@ use Illuminate\Http\Request;
  */
 class SyncRunController extends Controller
 {
-    protected const VALID_KINDS = ['all', 'exams', 'tools', 'tool_categories', 'tool_exam_mapping', 'tool_exam_content'];
+    protected const VALID_KINDS = ['all', 'exams', 'tools', 'tool_categories', 'tool_exam_mapping', 'tool_exam_content', 'tool_exam_documents'];
 
     public function start(Request $request)
     {
@@ -26,8 +26,16 @@ class SyncRunController extends Controller
             return response()->json(['message' => 'Invalid kind.'], 422);
         }
 
+        $mode = $request->input('mode', 'incremental');
+
+        if (! in_array($mode, ['incremental', 'full'], true)) {
+            return response()->json(['message' => "Invalid mode — use 'incremental' or 'full'."], 422);
+        }
+
         $run = SyncRun::create([
             'kind' => $kind,
+            'mode' => $mode,
+            'dry_run' => $request->boolean('dry_run'),
             'status' => 'pending',
             'steps' => RunBigQuerySyncJob::stepsFor($kind),
         ]);

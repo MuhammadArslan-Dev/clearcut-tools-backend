@@ -172,7 +172,16 @@
 <body>
     <div class="wrap">
         <h1>BigQuery Content Sync</h1>
-        <p class="sub">Pulls the clear-cutoff-435016.content.* tables into this app's database. Safe to re-run — every sync upserts by slug and never deletes.</p>
+        <p class="sub">Pulls the clear-cutoff-435016.content.* tables into this app's database. Safe to re-run — rows are matched by their <code>uid</code> (not slug) and nothing is ever deleted.</p>
+        <div class="worker-note" style="gap:18px;flex-wrap:wrap">
+            <label>Mode
+                <select id="sync-mode">
+                    <option value="incremental" selected>Sync changes only (new + edited rows)</option>
+                    <option value="full">Full resync (rewrite every row)</option>
+                </select>
+            </label>
+            <label><input type="checkbox" id="sync-dry-run"> Dry run (show what would change, write nothing)</label>
+        </div>
         <div id="worker-note" class="worker-note">
             <div class="worker-status">
                 <span id="worker-dot" class="dot"></span>
@@ -185,7 +194,7 @@
             <div class="row">
                 <div class="info">
                     <h2>Sync everything</h2>
-                    <p>Runs all 5 syncs below in the correct dependency order.</p>
+                    <p>Runs all 6 syncs below in the correct dependency order.</p>
                 </div>
                 <button data-kind="all" data-target="steps-all">Sync All</button>
             </div>
@@ -245,6 +254,17 @@
                 <button data-kind="tool_exam_content" data-target="steps-content">Sync</button>
             </div>
             <div id="steps-content" class="steps"></div>
+        </div>
+
+        <div class="card">
+            <div class="row">
+                <div class="info">
+                    <h2>Tool Exam Documents</h2>
+                    <p>content.tools_exam_documents &rarr; tool_exam_documents (photo / signature / thumb / declaration specs). Documents removed from the sheet are deactivated. <span class="order-hint">Needs Mapping synced first.</span></p>
+                </div>
+                <button data-kind="tool_exam_documents" data-target="steps-documents">Sync</button>
+            </div>
+            <div id="steps-documents" class="steps"></div>
         </div>
     </div>
 
@@ -308,9 +328,18 @@
                             ? 'running…'
                             : 'queued';
 
+                const lines = step.status === 'success'
+                    ? [
+                        ...(step.result?.url_changes || []).map((m) => 'URL CHANGE: ' + m),
+                        ...(step.result?.warnings || []),
+                    ]
+                    : [];
+
                 const detail = step.status === 'failed'
                     ? `<div class="step-detail err">${escapeHtml(step.error || '')}</div>`
-                    : '';
+                    : lines.length
+                        ? `<div class="step-detail">${escapeHtml(lines.slice(0, 20).join('\n'))}${lines.length > 20 ? '\n… +' + (lines.length - 20) + ' more' : ''}</div>`
+                        : '';
 
                 return `
                     <div class="step">
@@ -325,9 +354,12 @@
 
         function summarize(result) {
             if (!result || !result.stats) return 'done';
-            const { created, updated, skipped } = result.stats;
+            const { created, updated, unchanged = 0, skipped } = result.stats;
+            const urls = result.url_changes?.length ? `, ${result.url_changes.length} URL change(s)` : '';
             const warnings = result.warnings?.length ? `, ${result.warnings.length} warning(s)` : '';
-            return `+${created} / ~${updated} / -${skipped}${warnings}`;
+            const dry = result.dry_run ? '[dry run] ' : '';
+            const off = result.deactivated ? `, ${result.deactivated} deactivated` : '';
+            return `${dry}+${created} new / ~${updated} updated / =${unchanged} unchanged / -${skipped} skipped${off}${urls}${warnings}`;
         }
 
         function escapeHtml(str) {
@@ -375,7 +407,11 @@
                             'Content-Type': 'application/json',
                             'X-CSRF-TOKEN': csrfToken,
                         },
-                        body: JSON.stringify({ kind: btn.dataset.kind }),
+                        body: JSON.stringify({
+                            kind: btn.dataset.kind,
+                            mode: document.getElementById('sync-mode').value,
+                            dry_run: document.getElementById('sync-dry-run').checked,
+                        }),
                     });
 
                     if (!res.ok) {

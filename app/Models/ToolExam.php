@@ -10,17 +10,21 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 class ToolExam extends Model
 {
     protected $fillable = [
+        'uid',
+        'content_hash',
         'tool_id',
         'exam_id',
         'tool_category_id',
         'public_slug',
         'is_active',
         'sort_order',
+        'popular_rank',
     ];
 
     protected $casts = [
         'is_active' => 'boolean',
         'sort_order' => 'integer',
+        'popular_rank' => 'integer',
     ];
 
     public function tool(): BelongsTo
@@ -41,6 +45,11 @@ class ToolExam extends Model
     public function data(): HasOne
     {
         return $this->hasOne(ToolExamData::class);
+    }
+
+    public function documents(): HasMany
+    {
+        return $this->hasMany(ToolExamDocument::class)->orderBy('sort_order');
     }
 
     public function translations(): HasMany

@@ -6,6 +6,7 @@ use App\Models\SyncRun;
 use App\Services\BigQuery\BigQueryExamSyncService;
 use App\Services\BigQuery\BigQueryToolCategorySyncService;
 use App\Services\BigQuery\BigQueryToolExamContentSyncService;
+use App\Services\BigQuery\BigQueryToolExamDocumentSyncService;
 use App\Services\BigQuery\BigQueryToolExamSyncService;
 use App\Services\BigQuery\BigQueryToolSyncService;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -52,6 +53,7 @@ class RunBigQuerySyncJob implements ShouldQueue
         'tool_categories' => ['Tool Categories', BigQueryToolCategorySyncService::class],
         'tool_exam_mapping' => ['Tool ↔ Exam Mapping', BigQueryToolExamSyncService::class],
         'tool_exam_content' => ['Tool Exam Content (SEO)', BigQueryToolExamContentSyncService::class],
+        'tool_exam_documents' => ['Tool Exam Documents', BigQueryToolExamDocumentSyncService::class],
     ];
 
     public function __construct(protected int $syncRunId) {}
@@ -115,7 +117,7 @@ class RunBigQuerySyncJob implements ShouldQueue
 
             try {
                 $service = app($serviceClass);
-                $result = $service->sync();
+                $result = $service->sync($run->mode ?? 'incremental', (bool) $run->dry_run);
                 $run->markStepDone($key, $result);
             } catch (Throwable $e) {
                 $run->markStepFailed($key, $e->getMessage());

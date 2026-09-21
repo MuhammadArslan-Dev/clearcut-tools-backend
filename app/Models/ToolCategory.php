@@ -11,6 +11,8 @@ class ToolCategory extends Model
     // label/description live in tool_category_translations; icon isn't
     // text so it stays here, identical across every locale.
     protected $fillable = [
+        'uid',
+        'content_hash',
         'tool_id',
         'category_slug',
         'icon',

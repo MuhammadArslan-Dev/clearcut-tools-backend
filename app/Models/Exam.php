@@ -9,6 +9,8 @@ class Exam extends Model
 {
     // short_name/full_name/conducting_body live in exam_translations.
     protected $fillable = [
+        'uid',
+        'content_hash',
         'exam_slug',
     ];
 

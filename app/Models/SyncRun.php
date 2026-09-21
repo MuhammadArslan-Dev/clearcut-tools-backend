@@ -15,6 +15,8 @@ class SyncRun extends Model
 {
     protected $fillable = [
         'kind',
+        'mode',
+        'dry_run',
         'status',
         'steps',
         'started_at',
@@ -23,6 +25,7 @@ class SyncRun extends Model
 
     protected $casts = [
         'steps' => 'array',
+        'dry_run' => 'boolean',
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
     ];

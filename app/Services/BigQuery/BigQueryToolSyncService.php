@@ -5,18 +5,22 @@ namespace App\Services\BigQuery;
 use App\Models\Tool;
 use App\Models\ToolTranslation;
 use App\Services\BigQuery\Concerns\DecodesLocaleJson;
+use App\Services\BigQuery\Concerns\SyncsByUid;
 use Illuminate\Support\Facades\DB;
 
 /**
  * Syncs the `tools` BigQuery table into this app's `tools` +
  * `tool_translations` tables — the BigQuery counterpart of
- * GoogleSheets\SheetSyncService::syncTools(). Upsert-only by tool_slug,
- * mirroring BigQueryExamSyncService's conventions.
+ * GoogleSheets\SheetSyncService::syncTools(). Rows are matched by `uid`
+ * (T_0001, ...), see Concerns\SyncsByUid.
  *
- * Confirmed live schema (clear-cutoff-435016.content.tools):
+ * Source columns:
+ *   uid           stable id
  *   tool_slug     plain string, e.g. "resizer"
  *   tool_name     JSON string keyed by locale: {"en":{"name":"..."},"hi":{...}}
+ *   (or tool_name_json)
  *   description   JSON string keyed by locale: {"en":{"text":"..."},"hi":{...}}
+ *   (or description_json)
  *   status        plain string, e.g. "active"
  *   sort_order    numeric
  *
@@ -25,68 +29,112 @@ use Illuminate\Support\Facades\DB;
 class BigQueryToolSyncService
 {
     use DecodesLocaleJson;
+    use SyncsByUid;
 
     protected const QUERY = 'SELECT * FROM `clear-cutoff-435016.content.tools`';
-
-    /** @var array<int, string> */
-    protected array $warnings = [];
 
     public function __construct(protected BigQueryClient $client) {}
 
     /**
-     * @return array{stats: array{created: int, updated: int, skipped: int}, warnings: array<int, string>}
+     * @return array<string, mixed>
      */
-    public function sync(): array
+    public function sync(string $mode = self::MODE_INCREMENTAL, bool $dryRun = false): array
     {
-        $this->warnings = [];
+        $this->assertMode($mode);
+        $this->resetState();
+
         $rows = $this->client->runQuery(self::QUERY);
-        $stats = ['created' => 0, 'updated' => 0, 'skipped' => 0];
+        $this->requireUidColumn($rows, 'tools');
 
-        DB::transaction(function () use ($rows, &$stats) {
-            foreach ($rows as $i => $row) {
-                $slug = $row['tool_slug'] ?? null;
+        $stats = $this->emptyStats();
+        $entries = [];
 
-                if (! $slug) {
-                    $this->warnings[] = "row {$i}: missing tool_slug — row columns: ".implode(', ', array_keys($row));
-                    $stats['skipped']++;
+        foreach ($rows as $i => $row) {
+            $uid = $this->cleanString($row['uid'] ?? null);
+            $slug = $this->cleanString($row['tool_slug'] ?? null);
+            $label = "row {$i}".($uid ? " ({$uid})" : '');
 
-                    continue;
-                }
+            if (! $uid) {
+                $this->warnings[] = "{$label}: missing uid — row skipped (tool_slug '{$slug}')";
+                $stats['skipped']++;
 
-                $nameByLocale = $this->decodeLocaleMap($row['tool_name'] ?? null);
-                $descriptionByLocale = $this->decodeLocaleMap($row['description'] ?? null);
+                continue;
+            }
 
-                if (empty($nameByLocale)) {
-                    $nameByLocale = ['en' => ['name' => $row['tool_name'] ?? $slug]];
-                }
+            if (! $slug) {
+                $this->warnings[] = "{$label}: missing tool_slug — row skipped";
+                $stats['skipped']++;
 
-                $tool = Tool::updateOrCreate(
-                    ['tool_slug' => $slug],
-                    [
-                        'status' => $row['status'] ?? 'active',
-                        'sort_order' => (int) ($row['sort_order'] ?? 0),
-                    ],
-                );
+                continue;
+            }
 
-                foreach ($nameByLocale as $locale => $nameEntry) {
-                    $translation = ToolTranslation::updateOrCreate(
-                        ['tool_id' => $tool->id, 'locale' => $locale],
-                        [
-                            'tool_name' => $nameEntry['name'] ?? $slug,
-                            'description' => $descriptionByLocale[$locale]['text']
-                                ?? $descriptionByLocale['en']['text']
-                                ?? null,
-                        ],
-                    );
+            $nameRaw = $this->pick($row, ['tool_name', 'tool_name_json']);
+            $descriptionRaw = $this->pick($row, ['description', 'description_json']);
 
-                    $stats[$translation->wasRecentlyCreated ? 'created' : 'updated']++;
+            $nameByLocale = $this->decodeLocaleMap($nameRaw === null ? null : (string) $nameRaw);
+            $descriptionByLocale = $this->decodeLocaleMap($descriptionRaw === null ? null : (string) $descriptionRaw);
+
+            if (empty($nameByLocale)) {
+                $nameByLocale = ['en' => ['name' => $nameRaw ?? $slug]];
+            }
+
+            $status = $this->cleanString($row['status'] ?? null) ?? 'active';
+            $sortOrder = (int) ($row['sort_order'] ?? 0);
+
+            $entries[] = [
+                'uid' => $uid,
+                'label' => $label,
+                'key' => $slug,
+                'attrs' => ['tool_slug' => $slug, 'status' => $status, 'sort_order' => $sortOrder],
+                'hash' => $this->hashOf([
+                    'uid' => $uid,
+                    'tool_slug' => $slug,
+                    'status' => $status,
+                    'sort_order' => $sortOrder,
+                    'tool_name' => $nameByLocale,
+                    'description' => $descriptionByLocale,
+                ]),
+                'legacy' => ['tool_slug' => $slug],
+                'unique' => [['tool_slug' => $slug]],
+                'nameByLocale' => $nameByLocale,
+                'descriptionByLocale' => $descriptionByLocale,
+            ];
+        }
+
+        $todo = $this->plan(Tool::class, $entries, $mode, $stats);
+
+        if ($dryRun || empty($todo)) {
+            return $this->result($stats, $mode, $dryRun, $todo);
+        }
+
+        DB::transaction(function () use ($todo) {
+            $now = now();
+            $idsByUid = $this->apply(Tool::class, $todo);
+
+            $translationRows = [];
+
+            foreach ($todo as $item) {
+                foreach ($item['nameByLocale'] as $locale => $nameEntry) {
+                    $translationRows[] = [
+                        'tool_id' => $idsByUid[$item['uid']],
+                        'locale' => $locale,
+                        'tool_name' => $nameEntry['name'] ?? $item['key'],
+                        'description' => $item['descriptionByLocale'][$locale]['text']
+                            ?? $item['descriptionByLocale']['en']['text']
+                            ?? null,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
                 }
             }
+
+            ToolTranslation::query()->upsert(
+                $translationRows,
+                ['tool_id', 'locale'],
+                ['tool_name', 'description', 'updated_at'],
+            );
         });
 
-        return [
-            'stats' => $stats,
-            'warnings' => $this->warnings,
-        ];
+        return $this->result($stats, $mode, $dryRun, $todo);
     }
 }

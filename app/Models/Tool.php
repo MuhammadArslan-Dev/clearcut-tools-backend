@@ -11,6 +11,8 @@ class Tool extends Model
     // locale) — this table only holds what's identical across every
     // language.
     protected $fillable = [
+        'uid',
+        'content_hash',
         'tool_slug',
         'status',
         'sort_order',

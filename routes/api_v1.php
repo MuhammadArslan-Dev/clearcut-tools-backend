@@ -20,5 +20,6 @@ Route::prefix('bigquery')->controller(BigQueryController::class)->group(function
     Route::get('/syncToolCategories', 'syncToolCategories')->name('bigquery.syncToolCategories');
     Route::get('/syncToolExamMapping', 'syncToolExamMapping')->name('bigquery.syncToolExamMapping');
     Route::get('/syncToolExamContent', 'syncToolExamContent')->name('bigquery.syncToolExamContent');
+    Route::get('/syncToolExamDocuments', 'syncToolExamDocuments')->name('bigquery.syncToolExamDocuments');
     Route::get('/syncAll', 'syncAll')->name('bigquery.syncAll');
 });

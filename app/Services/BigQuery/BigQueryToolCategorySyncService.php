@@ -6,104 +6,200 @@ use App\Models\Tool;
 use App\Models\ToolCategory;
 use App\Models\ToolCategoryTranslation;
 use App\Services\BigQuery\Concerns\DecodesLocaleJson;
+use App\Services\BigQuery\Concerns\SyncsByUid;
 use Illuminate\Support\Facades\DB;
 
 /**
  * Syncs the `tool_categories` BigQuery table into this app's
  * `tool_categories` + `tool_category_translations` tables — the BigQuery
  * counterpart of GoogleSheets\SheetSyncService::syncToolCategories().
- * Depends on `tools` having already been synced (resolves tool_id by
- * tool_slug; a row whose tool isn't found yet is skipped and warned
- * about, not fatal to the rest of the sync).
+ * Rows are matched by `uid` (TC_0001, ...), see Concerns\SyncsByUid.
  *
- * Confirmed live schema (clear-cutoff-435016.content.tool_categories):
- *   tool_slug       plain string, e.g. "resizer"
- *   category_slug   plain string, e.g. "teaching-exams-tet-tgt-pgt"
- *   label           JSON string keyed by locale: {"en":{"name":"..."},"hi":{...}}
- *   icon            plain string (URL) or null — not localized
- *   description     plain string — NOT localized here (unlike `tools`'
- *                   description), so the same value is written to every
- *                   locale's translation row
- *   sort_order      numeric
- *   is_active       bool / "TRUE"/"FALSE"
+ * Depends on `tools` having been synced: the parent is resolved by
+ * `tool_uid` (falling back to `tool_slug` only when tool_uid is blank).
  *
- * One `ToolCategoryTranslation` row is written per locale found in `label`.
+ * Source columns:
+ *   uid, tool_uid, tool_slug, category_slug
+ *   label         JSON string keyed by locale: {"en":{"name":"..."},"hi":{...}}
+ *   icon          plain string (URL) or null — not localized
+ *   description   plain string — NOT localized, written to every locale row
+ *   sort_order    numeric
+ *   is_active     bool / "TRUE"/"FALSE"
+ *
+ * The tools frontend derives a category's page URL from its English
+ * `label` (not category_slug), so a changed English label is reported in
+ * `url_changes`.
  */
 class BigQueryToolCategorySyncService
 {
     use DecodesLocaleJson;
+    use SyncsByUid;
 
     protected const QUERY = 'SELECT * FROM `clear-cutoff-435016.content.tool_categories`';
-
-    /** @var array<int, string> */
-    protected array $warnings = [];
 
     public function __construct(protected BigQueryClient $client) {}
 
     /**
-     * @return array{stats: array{created: int, updated: int, skipped: int}, warnings: array<int, string>}
+     * @return array<string, mixed>
      */
-    public function sync(): array
+    public function sync(string $mode = self::MODE_INCREMENTAL, bool $dryRun = false): array
     {
-        $this->warnings = [];
+        $this->assertMode($mode);
+        $this->resetState();
+
         $rows = $this->client->runQuery(self::QUERY);
-        $stats = ['created' => 0, 'updated' => 0, 'skipped' => 0];
+        $this->requireUidColumn($rows, 'tool_categories');
 
-        DB::transaction(function () use ($rows, &$stats) {
-            foreach ($rows as $i => $row) {
-                $toolSlug = $row['tool_slug'] ?? null;
-                $categorySlug = $row['category_slug'] ?? null;
+        $stats = $this->emptyStats();
+        $entries = [];
 
-                if (! $toolSlug || ! $categorySlug) {
-                    $this->warnings[] = "row {$i}: missing tool_slug or category_slug";
-                    $stats['skipped']++;
+        $toolIdsByUid = Tool::query()->whereNotNull('uid')->pluck('id', 'uid');
+        $toolIdsBySlug = Tool::query()->pluck('id', 'tool_slug');
 
-                    continue;
-                }
+        foreach ($rows as $i => $row) {
+            $uid = $this->cleanString($row['uid'] ?? null);
+            $categorySlug = $this->cleanString($row['category_slug'] ?? null);
+            $label = "row {$i}".($uid ? " ({$uid})" : '');
 
-                $tool = Tool::where('tool_slug', $toolSlug)->first();
+            if (! $uid) {
+                $this->warnings[] = "{$label}: missing uid — row skipped (category_slug '{$categorySlug}')";
+                $stats['skipped']++;
 
-                if (! $tool) {
-                    $this->warnings[] = "row {$i}: tool_slug '{$toolSlug}' not found — sync tools first, row skipped";
-                    $stats['skipped']++;
+                continue;
+            }
 
-                    continue;
-                }
+            if (! $categorySlug) {
+                $this->warnings[] = "{$label}: missing category_slug — row skipped";
+                $stats['skipped']++;
 
-                $labelByLocale = $this->decodeLocaleMap($row['label'] ?? null);
+                continue;
+            }
 
-                if (empty($labelByLocale)) {
-                    $labelByLocale = ['en' => ['name' => $row['label'] ?? $categorySlug]];
-                }
+            $toolId = $this->resolveRef(
+                $toolIdsByUid,
+                $toolIdsBySlug,
+                $this->cleanString($row['tool_uid'] ?? null),
+                $this->cleanString($row['tool_slug'] ?? null),
+                'tool',
+                $label,
+            );
 
-                $category = ToolCategory::updateOrCreate(
-                    ['tool_id' => $tool->id, 'category_slug' => $categorySlug],
-                    [
-                        'icon' => $row['icon'] ?? null,
-                        'sort_order' => (int) ($row['sort_order'] ?? 0),
-                        'is_active' => $this->normalizeBool($row['is_active'] ?? null, true),
-                    ],
-                );
+            if ($toolId === null) {
+                $stats['skipped']++;
 
-                $description = $row['description'] ?? null;
+                continue;
+            }
 
-                foreach ($labelByLocale as $locale => $labelEntry) {
-                    $translation = ToolCategoryTranslation::updateOrCreate(
-                        ['tool_category_id' => $category->id, 'locale' => $locale],
-                        [
-                            'label' => $labelEntry['name'] ?? $categorySlug,
-                            'description' => $description,
-                        ],
-                    );
+            $labelRaw = $this->pick($row, ['label', 'label_json']);
+            $labelByLocale = $this->decodeLocaleMap($labelRaw === null ? null : (string) $labelRaw);
 
-                    $stats[$translation->wasRecentlyCreated ? 'created' : 'updated']++;
+            if (empty($labelByLocale)) {
+                $labelByLocale = ['en' => ['name' => $labelRaw ?? $categorySlug]];
+            }
+
+            $icon = $this->cleanString($row['icon'] ?? null);
+            $sortOrder = (int) ($row['sort_order'] ?? 0);
+            $isActive = $this->normalizeBool($row['is_active'] ?? null, true);
+            $description = $this->cleanString($row['description'] ?? null);
+
+            $entries[] = [
+                'uid' => $uid,
+                'label' => $label,
+                'key' => $categorySlug,
+                'attrs' => [
+                    'tool_id' => $toolId,
+                    'category_slug' => $categorySlug,
+                    'icon' => $icon,
+                    'sort_order' => $sortOrder,
+                    'is_active' => $isActive,
+                ],
+                'hash' => $this->hashOf([
+                    'uid' => $uid,
+                    'tool_id' => $toolId,
+                    'category_slug' => $categorySlug,
+                    'icon' => $icon,
+                    'sort_order' => $sortOrder,
+                    'is_active' => $isActive,
+                    'label' => $labelByLocale,
+                    'description' => $description,
+                ]),
+                'legacy' => ['tool_id' => $toolId, 'category_slug' => $categorySlug],
+                'unique' => [['tool_id' => $toolId, 'category_slug' => $categorySlug]],
+                'labelByLocale' => $labelByLocale,
+                'description' => $description,
+            ];
+        }
+
+        $todo = $this->plan(ToolCategory::class, $entries, $mode, $stats);
+
+        $this->reportLabelChanges($todo);
+
+        if ($dryRun || empty($todo)) {
+            return $this->result($stats, $mode, $dryRun, $todo);
+        }
+
+        DB::transaction(function () use ($todo) {
+            $now = now();
+            $idsByUid = $this->apply(ToolCategory::class, $todo);
+
+            $translationRows = [];
+
+            foreach ($todo as $item) {
+                foreach ($item['labelByLocale'] as $locale => $labelEntry) {
+                    $translationRows[] = [
+                        'tool_category_id' => $idsByUid[$item['uid']],
+                        'locale' => $locale,
+                        'label' => $labelEntry['name'] ?? $item['key'],
+                        'description' => $item['description'],
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
                 }
             }
+
+            ToolCategoryTranslation::query()->upsert(
+                $translationRows,
+                ['tool_category_id', 'locale'],
+                ['label', 'description', 'updated_at'],
+            );
         });
 
-        return [
-            'stats' => $stats,
-            'warnings' => $this->warnings,
-        ];
+        return $this->result($stats, $mode, $dryRun, $todo);
+    }
+
+    /**
+     * The frontend slugifies the English label into the category page URL,
+     * so an edited English label moves that page.
+     *
+     * @param  array<int, array<string, mixed>>  $todo
+     */
+    protected function reportLabelChanges(array $todo): void
+    {
+        $existingIds = collect($todo)
+            ->filter(fn ($t) => $t['existing'] !== null)
+            ->map(fn ($t) => $t['existing']->id)
+            ->all();
+
+        if (empty($existingIds)) {
+            return;
+        }
+
+        $oldLabels = ToolCategoryTranslation::query()
+            ->whereIn('tool_category_id', $existingIds)
+            ->where('locale', 'en')
+            ->pluck('label', 'tool_category_id');
+
+        foreach ($todo as $item) {
+            if ($item['existing'] === null) {
+                continue;
+            }
+
+            $old = $oldLabels->get($item['existing']->id);
+            $new = $item['labelByLocale']['en']['name'] ?? null;
+
+            if ($old !== null && $new !== null && $old !== $new) {
+                $this->urlChanges[] = "category {$item['uid']}: English label '{$old}' → '{$new}' — the category page URL changes";
+            }
+        }
     }
 }

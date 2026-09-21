@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Resources\ToolExamResource;
 use App\Models\Tool;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Http\Request;
 use Spatie\QueryBuilder\AllowedFilter;
 use Spatie\QueryBuilder\QueryBuilder;
 
@@ -17,15 +18,17 @@ class ToolExamController extends Controller
     /**
      * GET /api/v1/tools/{tool}/exams
      *
+     * Only active rows are returned by default; pass ?filter[is_active]=0
+     * (or =1) to override.
      * Filter: ?filter[is_active]=1
      *         ?filter[category]=teaching-exams-tet-tgt-pgt  (tool_categories.category_slug)
      *         ?filter[exam]=htet                            (exams.exam_slug)
      *         ?filter[search]=teacher                        (exam short_name/full_name, current locale)
      * Sort:   ?sort=sort_order or ?sort=-sort_order (default: sort_order)
      */
-    public function index(Tool $tool)
+    public function index(Request $request, Tool $tool)
     {
-        $toolExams = QueryBuilder::for($tool->toolExams())
+        $builder = QueryBuilder::for($tool->toolExams())
             ->allowedFilters([
                 AllowedFilter::exact('is_active'),
                 AllowedFilter::callback('category', fn (Builder $query, $value) => $query->whereHas(
@@ -46,10 +49,17 @@ class ToolExamController extends Controller
             ])
             ->allowedSorts(['sort_order', 'public_slug'])
             ->defaultSort('sort_order')
-            ->with(self::EAGER)
-            ->get();
+            ->with(self::EAGER);
 
-        return ApiResponse::success(ToolExamResource::collection($toolExams));
+        // Inactive rows (is_active = false in the sheet) are hidden unless
+        // the caller explicitly asks with ?filter[is_active]=...; without
+        // this the static tools site kept building pages for rows switched
+        // off in the sheet.
+        if (! $request->has('filter.is_active')) {
+            $builder->where('is_active', true);
+        }
+
+        return ApiResponse::success(ToolExamResource::collection($builder->get()));
     }
 
     /**
@@ -59,7 +69,8 @@ class ToolExamController extends Controller
     {
         $toolExam = $tool->toolExams()
             ->where('public_slug', $publicSlug)
-            ->with([...self::EAGER, 'data', 'contentTranslations'])
+            ->where('is_active', true)
+            ->with([...self::EAGER, 'data', 'contentTranslations', 'documents'])
             ->first();
 
         if (! $toolExam) {

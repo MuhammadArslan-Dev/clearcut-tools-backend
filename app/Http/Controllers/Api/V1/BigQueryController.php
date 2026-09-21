@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Services\BigQuery\BigQueryExamSyncService;
 use App\Services\BigQuery\BigQueryToolCategorySyncService;
 use App\Services\BigQuery\BigQueryToolExamContentSyncService;
+use App\Services\BigQuery\BigQueryToolExamDocumentSyncService;
 use App\Services\BigQuery\BigQueryToolExamSyncService;
 use App\Services\BigQuery\BigQueryToolSyncService;
 use RuntimeException;
@@ -76,6 +77,18 @@ class BigQueryController extends Controller
     }
 
     /**
+     * GET /api/v1/bigquery/syncToolExamDocuments
+     *
+     * Pulls `clear-cutoff-435016.content.tools_exam_documents`. Requires
+     * syncToolExamMapping to have already run (resolves the parent by
+     * mapping_uid). Documents dropped from the sheet are deactivated.
+     */
+    public function syncToolExamDocuments(BigQueryToolExamDocumentSyncService $service)
+    {
+        return $this->runSync($service, 'Tool exam documents sync complete');
+    }
+
+    /**
      * GET /api/v1/bigquery/syncAll
      *
      * Runs all 5 content syncs in their required dependency order
@@ -92,6 +105,7 @@ class BigQueryController extends Controller
         BigQueryToolCategorySyncService $toolCategories,
         BigQueryToolExamSyncService $toolExamMapping,
         BigQueryToolExamContentSyncService $toolExamContent,
+        BigQueryToolExamDocumentSyncService $toolExamDocuments,
     ) {
         $steps = [
             'exams' => $exams,
@@ -99,13 +113,20 @@ class BigQueryController extends Controller
             'tool_categories' => $toolCategories,
             'tool_exam_mapping' => $toolExamMapping,
             'tool_exam_content' => $toolExamContent,
+            'tool_exam_documents' => $toolExamDocuments,
         ];
+
+        if (! in_array(request()->query('mode', 'incremental'), ['incremental', 'full'], true)) {
+            return ApiResponse::error("Invalid mode — use 'incremental' or 'full'.", 422);
+        }
+
+        [$mode, $dryRun] = $this->syncOptions();
 
         $results = [];
 
         foreach ($steps as $key => $service) {
             try {
-                $results[$key] = $service->sync();
+                $results[$key] = $service->sync($mode, $dryRun);
             } catch (Throwable $e) {
                 $results[$key] = ['error' => $e->getMessage()];
             }
@@ -114,10 +135,28 @@ class BigQueryController extends Controller
         return ApiResponse::success($results, 'Full content sync complete');
     }
 
+    /**
+     * ?mode=incremental (default, only new/changed rows) | full (rewrite
+     * every row), and ?dry_run=1 to report what would change without
+     * writing anything.
+     *
+     * @return array{0: string, 1: bool}
+     */
+    private function syncOptions(): array
+    {
+        return [(string) request()->query('mode', 'incremental'), request()->boolean('dry_run')];
+    }
+
     private function runSync(object $service, string $successMessage)
     {
+        if (! in_array(request()->query('mode', 'incremental'), ['incremental', 'full'], true)) {
+            return ApiResponse::error("Invalid mode — use 'incremental' or 'full'.", 422);
+        }
+
+        [$mode, $dryRun] = $this->syncOptions();
+
         try {
-            $result = $service->sync();
+            $result = $service->sync($mode, $dryRun);
         } catch (RuntimeException $e) {
             // Config/credentials problems — message is already written to
             // be read directly by whoever is setting this up.

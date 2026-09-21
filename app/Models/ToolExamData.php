@@ -13,6 +13,8 @@ class ToolExamData extends Model
     // is identical across every language; see ToolExamContentTranslation
     // for actual translatable prose.
     protected $fillable = [
+        'uid',
+        'content_hash',
         'tool_exam_id',
         'data_json',
     ];

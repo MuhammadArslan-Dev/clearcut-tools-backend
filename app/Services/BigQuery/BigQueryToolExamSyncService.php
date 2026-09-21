@@ -7,144 +7,174 @@ use App\Models\Tool;
 use App\Models\ToolCategory;
 use App\Models\ToolExam;
 use App\Services\BigQuery\Concerns\DecodesLocaleJson;
+use App\Services\BigQuery\Concerns\SyncsByUid;
 use Illuminate\Support\Facades\DB;
 
 /**
- * Syncs the `tool_exam_mapping` BigQuery table into this app's
+ * Syncs the `tools_exam_mapping` BigQuery table (note the `tools_` prefix — the
+ * BigQuery table names differ from this app's `tool_exam_*` step keys) into this app's
  * `tool_exams` pivot table — the BigQuery counterpart of
- * GoogleSheets\SheetSyncService::syncToolExams(). Depends on `tools`,
- * `exams`, and `tool_categories` having already been synced.
+ * GoogleSheets\SheetSyncService::syncToolExams(). Rows are matched by
+ * `uid` (TE_0001, ...), see Concerns\SyncsByUid. Depends on `tools`,
+ * `exams` and `tool_categories` having been synced.
  *
- * Confirmed live schema (clear-cutoff-435016.content.tool_exam_mapping):
- *   tool_slug       plain string
- *   exam_slug       plain string
- *   category_slug   plain string — optional; a category link is dropped
- *                   (not fatal) if it can't be resolved for this tool
- *   public_slug     plain string
- *   is_active       bool / "TRUE"/"FALSE"
- *   sort_order      numeric
+ * Source columns:
+ *   uid
+ *   tool_uid, exam_uid   parents, resolved by uid (slug only as a fallback
+ *                        when the uid cell is blank)
+ *   category_uid         optional; a category that can't be resolved drops
+ *                        the link (row still saved) and is warned about
+ *   tool_slug, exam_slug, category_slug   readable copies / fallback keys
+ *   public_slug          the exam's page URL in the tools frontend
+ *   is_active            bool / "TRUE"/"FALSE"
+ *   sort_order           numeric
+ *   popular_rank         optional integer; 1 = first "Popular" exam, blank = not popular
  *
- * No per-locale fields here — one `ToolExam` row per (tool, exam) pair.
- *
- * Tool/exam/category lookups are preloaded into slug-keyed maps up front
- * (3 queries total) instead of a `where(...)->first()` per row, and the
- * resulting rows are written with one `ToolExam::upsert()` instead of
- * one `updateOrCreate()` per row — see BigQueryExamSyncService's docblock
- * for why (a remote, production-shared DB makes per-row round trips the
- * dominant cost, not BigQuery or PHP time).
+ * A changed public_slug on an existing row moves that page's URL, so it is
+ * reported in `url_changes`.
  */
 class BigQueryToolExamSyncService
 {
     use DecodesLocaleJson;
+    use SyncsByUid;
 
-    protected const QUERY = 'SELECT * FROM `clear-cutoff-435016.content.tool_exam_mapping`';
-
-    /** @var array<int, string> */
-    protected array $warnings = [];
+    protected const QUERY = 'SELECT * FROM `clear-cutoff-435016.content.tools_exam_mapping`';
 
     public function __construct(protected BigQueryClient $client) {}
 
     /**
-     * @return array{stats: array{created: int, updated: int, skipped: int}, warnings: array<int, string>}
+     * @return array<string, mixed>
      */
-    public function sync(): array
+    public function sync(string $mode = self::MODE_INCREMENTAL, bool $dryRun = false): array
     {
-        $this->warnings = [];
+        $this->assertMode($mode);
+        $this->resetState();
+
         $rows = $this->client->runQuery(self::QUERY);
-        $stats = ['created' => 0, 'updated' => 0, 'skipped' => 0];
+        $this->requireUidColumn($rows, 'tool_exam_mapping');
 
-        $toolIdsBySlug = Tool::pluck('id', 'tool_slug');
-        $examIdsBySlug = Exam::pluck('id', 'exam_slug');
-        $categoryIdsByToolAndSlug = ToolCategory::get(['id', 'tool_id', 'category_slug'])
-            ->keyBy(fn ($c) => $c->tool_id.'|'.$c->category_slug);
+        $stats = $this->emptyStats();
+        $entries = [];
 
-        $mappingRows = [];
+        $toolIdsByUid = Tool::query()->whereNotNull('uid')->pluck('id', 'uid');
+        $toolIdsBySlug = Tool::query()->pluck('id', 'tool_slug');
+        $examIdsByUid = Exam::query()->whereNotNull('uid')->pluck('id', 'uid');
+        $examIdsBySlug = Exam::query()->pluck('id', 'exam_slug');
+        $categories = ToolCategory::query()->get(['id', 'uid', 'tool_id', 'category_slug']);
+        $categoryIdsByUid = $categories->whereNotNull('uid')->pluck('id', 'uid');
+        $categoryIdsByToolAndSlug = $categories->mapWithKeys(fn ($c) => [$c->tool_id.'|'.$c->category_slug => $c->id]);
 
         foreach ($rows as $i => $row) {
-            $toolSlug = $row['tool_slug'] ?? null;
-            $examSlug = $row['exam_slug'] ?? null;
+            $uid = $this->cleanString($row['uid'] ?? null);
+            $label = "row {$i}".($uid ? " ({$uid})" : '');
 
-            if (! $toolSlug || ! $examSlug) {
-                $this->warnings[] = "row {$i}: missing tool_slug or exam_slug";
+            if (! $uid) {
+                $this->warnings[] = "{$label}: missing uid — row skipped";
                 $stats['skipped']++;
 
                 continue;
             }
 
-            $toolId = $toolIdsBySlug[$toolSlug] ?? null;
+            $toolId = $this->resolveRef(
+                $toolIdsByUid,
+                $toolIdsBySlug,
+                $this->cleanString($row['tool_uid'] ?? null),
+                $this->cleanString($row['tool_slug'] ?? null),
+                'tool',
+                $label,
+            );
 
-            if (! $toolId) {
-                $this->warnings[] = "row {$i}: tool_slug '{$toolSlug}' not found — sync tools first, row skipped";
+            $examId = $this->resolveRef(
+                $examIdsByUid,
+                $examIdsBySlug,
+                $this->cleanString($row['exam_uid'] ?? null),
+                $this->cleanString($row['exam_slug'] ?? null),
+                'exam',
+                $label,
+            );
+
+            if ($toolId === null || $examId === null) {
                 $stats['skipped']++;
 
                 continue;
             }
 
-            $examId = $examIdsBySlug[$examSlug] ?? null;
+            // Category is optional. Its slug is only meaningful within a
+            // tool, so the slug fallback is keyed by tool_id|category_slug.
+            $categorySlug = $this->cleanString($row['category_slug'] ?? null);
+            $categoryBySlug = collect();
 
-            if (! $examId) {
-                $this->warnings[] = "row {$i}: exam_slug '{$examSlug}' not found — sync exams first, row skipped";
-                $stats['skipped']++;
-
-                continue;
+            if ($categorySlug !== null && $categoryIdsByToolAndSlug->has($toolId.'|'.$categorySlug)) {
+                $categoryBySlug = collect([$categorySlug => $categoryIdsByToolAndSlug->get($toolId.'|'.$categorySlug)]);
             }
 
-            $categorySlug = $row['category_slug'] ?? null;
-            $categoryId = null;
+            $categoryId = $this->resolveRef(
+                $categoryIdsByUid,
+                $categoryBySlug,
+                $this->cleanString($row['category_uid'] ?? null),
+                $categorySlug,
+                'category',
+                $label,
+                required: false,
+            );
 
-            if ($categorySlug) {
-                $category = $categoryIdsByToolAndSlug->get($toolId.'|'.$categorySlug);
+            $publicSlug = $this->cleanString($row['public_slug'] ?? null)
+                ?? $this->cleanString($row['exam_slug'] ?? null)
+                ?? $uid;
+            $isActive = $this->normalizeBool($row['is_active'] ?? null, true);
+            $sortOrder = (int) ($row['sort_order'] ?? 0);
+            $rankRaw = $this->cleanString($row['popular_rank'] ?? null);
+            $popularRank = $rankRaw !== null && is_numeric($rankRaw) && (int) $rankRaw > 0 ? (int) $rankRaw : null;
 
-                if ($category) {
-                    $categoryId = $category->id;
-                } else {
-                    $this->warnings[] = "row {$i}: category_slug '{$categorySlug}' not found for tool '{$toolSlug}' — saved without a category";
-                }
-            }
-
-            // Keyed by tool_id|exam_id so a slug pair repeated in the
-            // source collapses to one upsert row instead of erroring on a
-            // duplicate ON CONFLICT target.
-            $mappingRows[$toolId.'|'.$examId] = [
-                'tool_id' => $toolId,
-                'exam_id' => $examId,
-                'tool_category_id' => $categoryId,
-                'public_slug' => $row['public_slug'] ?? $examSlug,
-                'is_active' => $this->normalizeBool($row['is_active'] ?? null, true),
-                'sort_order' => (int) ($row['sort_order'] ?? 0),
+            $entries[] = [
+                'uid' => $uid,
+                'label' => $label,
+                'key' => $publicSlug,
+                'attrs' => [
+                    'tool_id' => $toolId,
+                    'exam_id' => $examId,
+                    'tool_category_id' => $categoryId,
+                    'public_slug' => $publicSlug,
+                    'is_active' => $isActive,
+                    'sort_order' => $sortOrder,
+                    'popular_rank' => $popularRank,
+                ],
+                'hash' => $this->hashOf([
+                    'uid' => $uid,
+                    'tool_id' => $toolId,
+                    'exam_id' => $examId,
+                    'tool_category_id' => $categoryId,
+                    'public_slug' => $publicSlug,
+                    'is_active' => $isActive,
+                    'sort_order' => $sortOrder,
+                    'popular_rank' => $popularRank,
+                ]),
+                'legacy' => ['tool_id' => $toolId, 'exam_id' => $examId],
+                'unique' => [
+                    ['tool_id' => $toolId, 'exam_id' => $examId],
+                    ['tool_id' => $toolId, 'public_slug' => $publicSlug],
+                ],
             ];
         }
 
-        if (empty($mappingRows)) {
-            return ['stats' => $stats, 'warnings' => $this->warnings];
+        $todo = $this->plan(ToolExam::class, $entries, $mode, $stats);
+
+        foreach ($todo as $item) {
+            $old = $item['existing']?->public_slug;
+
+            if ($old !== null && $old !== $item['attrs']['public_slug']) {
+                $this->urlChanges[] = "tool_exam {$item['uid']}: public_slug '{$old}' → '{$item['attrs']['public_slug']}' — the exam page URL changes";
+            }
         }
 
-        DB::transaction(function () use ($mappingRows, &$stats) {
-            $now = now();
+        if ($dryRun || empty($todo)) {
+            return $this->result($stats, $mode, $dryRun, $todo);
+        }
 
-            $existingPairs = ToolExam::query()
-                ->get(['tool_id', 'exam_id'])
-                ->map(fn ($t) => $t->tool_id.'|'.$t->exam_id)
-                ->flip();
-
-            $upsertRows = [];
-
-            foreach ($mappingRows as $key => $row) {
-                $stats[$existingPairs->has($key) ? 'updated' : 'created']++;
-
-                $upsertRows[] = [...$row, 'created_at' => $now, 'updated_at' => $now];
-            }
-
-            ToolExam::query()->upsert(
-                $upsertRows,
-                ['tool_id', 'exam_id'],
-                ['tool_category_id', 'public_slug', 'is_active', 'sort_order', 'updated_at'],
-            );
+        DB::transaction(function () use ($todo) {
+            $this->apply(ToolExam::class, $todo);
         });
 
-        return [
-            'stats' => $stats,
-            'warnings' => $this->warnings,
-        ];
+        return $this->result($stats, $mode, $dryRun, $todo);
     }
 }
