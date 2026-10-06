@@ -4,3 +4,20 @@
 # laravel-vite-plugin@2, which all require Node >=20 — pin it explicitly
 # rather than relying solely on package.json's "engines.node" field.
 NIXPACKS_NODE_VERSION = "20"
+
+# Web (nginx + php-fpm), queue worker and scheduler all run in this one
+# container under Supervisor. See deploy/start.sh and deploy/supervisor/.
+[phases.setup]
+nixPkgs = ["...", "python311Packages.supervisor"]
+
+[phases.build]
+cmds = [
+    "mkdir -p /etc/supervisor/conf.d/",
+    "cp /app/deploy/supervisor/worker-*.conf /etc/supervisor/conf.d/",
+    "cp /app/deploy/supervisor/supervisord.conf /etc/supervisord.conf",
+    "chmod +x /app/deploy/start.sh",
+    "..."
+]
+
+[start]
+cmd = "/app/deploy/start.sh"
