@@ -43,6 +43,14 @@ class RunBigQuerySyncJob implements ShouldQueue
     public int $tries = 5;
 
     /**
+     * Seconds a single run may take before the worker kills it. The default
+     * queue:work timeout is 60s, which a large sync exceeds. Keep this in
+     * step with --timeout on the worker and DB_QUEUE_RETRY_AFTER (which must
+     * be longer than this).
+     */
+    public int $timeout = 1800;
+
+    /**
      * key => [label, service class]. Order here is the required
      * dependency order (exams/tools have none; categories needs tools;
      * mapping needs tools+exams+categories; content needs mapping).
