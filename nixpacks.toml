@@ -15,9 +15,10 @@ cmds = [
     "mkdir -p /etc/supervisor/conf.d/",
     "cp /app/deploy/supervisor/worker-*.conf /etc/supervisor/conf.d/",
     "cp /app/deploy/supervisor/supervisord.conf /etc/supervisord.conf",
-    "chmod +x /app/deploy/start.sh",
     "..."
 ]
 
+# Run through bash explicitly: the execute bit is not preserved from a
+# Windows checkout, so executing start.sh directly fails with "Permission denied".
 [start]
-cmd = "/app/deploy/start.sh"
+cmd = "bash /app/deploy/start.sh"
