@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\V1\BigQueryController;
 use App\Http\Controllers\Api\V1\ToolCategoryController;
 use App\Http\Controllers\Api\V1\ToolController;
 use App\Http\Controllers\Api\V1\ToolExamController;
+use App\Http\Middleware\FlushCacheAfterSync;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('tools')->group(function () {
@@ -14,7 +15,7 @@ Route::prefix('tools')->group(function () {
     Route::get('/{tool:tool_slug}/exams/{publicSlug}', [ToolExamController::class, 'show'])->name('tools.exams.show');
 });
 
-Route::prefix('bigquery')->controller(BigQueryController::class)->group(function () {
+Route::prefix('bigquery')->controller(BigQueryController::class)->middleware(FlushCacheAfterSync::class)->group(function () {
     Route::get('/syncExam', 'syncExam')->name('bigquery.syncExam');
     Route::get('/syncTools', 'syncTools')->name('bigquery.syncTools');
     Route::get('/syncToolCategories', 'syncToolCategories')->name('bigquery.syncToolCategories');

@@ -12,6 +12,7 @@ use App\Services\BigQuery\BigQueryToolSyncService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Illuminate\Support\Facades\Cache;
 use Throwable;
 
 /**
@@ -137,5 +138,11 @@ class RunBigQuerySyncJob implements ShouldQueue
             'status' => $anyFailed ? 'failed' : 'completed',
             'completed_at' => now(),
         ]);
+
+        // Same as FlushCacheAfterSync for the API routes: drop cached responses
+        // so new synced data shows up. Dry runs wrote nothing, so skip them.
+        if (! $run->dry_run) {
+            Cache::flush();
+        }
     }
 }

@@ -1,0 +1,77 @@
+{
+  "info": {
+    "name": "ClearCut Tools API",
+    "description": "Endpoints for the ClearCut Tools backend. Set the baseUrl variable first. The admin folder needs a browser session (CSRF) and does not work from Postman without copying the cookie and X-CSRF-TOKEN from the page. Start with dryRun=1 for any BigQuery sync.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "https://tools-api.clearcutoff.in" },
+    { "key": "dryRun", "value": "1", "description": "1 = report only, write nothing. Set to 0 for a real sync." },
+    { "key": "runId", "value": "1", "description": "SyncRun id returned by POST admin/bigquery-sync/runs." }
+  ],
+  "item": [
+    {
+      "name": "Public API",
+      "item": [
+        {
+          "name": "List tools",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/tools", "host": ["{{baseUrl}}"], "path": ["api", "v1", "tools"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "BigQuery sync (API, synchronous)",
+      "description": "Runs inline in the HTTP request. Use dryRun=1 for checks. Large real syncs should go through the admin queued runner instead, because they can hit the proxy timeout.",
+      "item": [
+        { "name": "syncExam", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncExam?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncExam"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncTools", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncTools?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncTools"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncToolCategories", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncToolCategories?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncToolCategories"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncToolExamMapping", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncToolExamMapping?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncToolExamMapping"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncToolExamContent", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncToolExamContent?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncToolExamContent"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncToolExamDocuments", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncToolExamDocuments?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncToolExamDocuments"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } },
+        { "name": "syncAll", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/api/v1/bigquery/syncAll?dry_run={{dryRun}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "bigquery", "syncAll"], "query": [{ "key": "dry_run", "value": "{{dryRun}}" }] } } }
+      ]
+    },
+    {
+      "name": "Admin (queued sync, browser session needed)",
+      "item": [
+        {
+          "name": "Start queued sync run",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-CSRF-TOKEN", "value": "<copy from the admin page>" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"kind\": \"all\",\n  \"mode\": \"incremental\",\n  \"dry_run\": true\n}" },
+            "url": { "raw": "{{baseUrl}}/admin/bigquery-sync/runs", "host": ["{{baseUrl}}"], "path": ["admin", "bigquery-sync", "runs"] }
+          },
+          "description": "kind: all | exams | tools | tool_categories | tool_exam_mapping | tool_exam_content | tool_exam_documents. mode: incremental | full."
+        },
+        {
+          "name": "Get queued sync run",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/admin/bigquery-sync/runs/{{runId}}", "host": ["{{baseUrl}}"], "path": ["admin", "bigquery-sync", "runs", "{{runId}}"] }
+          },
+          "description": "Poll this for step-by-step status: pending, running, completed or failed."
+        },
+        {
+          "name": "Worker status (disabled in production)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/admin/bigquery-sync/worker", "host": ["{{baseUrl}}"], "path": ["admin", "bigquery-sync", "worker"] }
+          },
+          "description": "Returns 403 in production. Supervisor manages the worker there."
+        }
+      ]
+    }
+  ]
+}
