@@ -126,7 +126,10 @@ class SheetSyncService
                     continue;
                 }
 
-                $exam = Exam::updateOrCreate(['exam_slug' => $slug], []);
+                $exam = Exam::updateOrCreate(
+                    ['exam_slug' => $slug],
+                    ['icon' => $this->nullIfBlank($row['icon'] ?? '')],
+                );
 
                 $translation = ExamTranslation::updateOrCreate(
                     ['exam_id' => $exam->id, 'locale' => $this->resolveLocale($row)],

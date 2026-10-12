@@ -24,6 +24,7 @@ use Illuminate\Support\Facades\DB;
  *   (or full_name_json)  {"en":{"name":"..."},"hi":{"name":"..."}}
  *   conducting_body  same per-locale JSON shape as full_name, optional
  *   (or conducting_body_json)
+ *   icon             plain string (URL) or null — not localized
  *
  * One `ExamTranslation` row is written per locale found in `full_name`.
  * Writes are batched (`upsert()`), because the DB is remote and a
@@ -77,6 +78,7 @@ class BigQueryExamSyncService
 
             $fullNameByLocale = $this->decodeLocaleMap($fullNameRaw === null ? null : (string) $fullNameRaw);
             $conductingBodyByLocale = $this->decodeLocaleMap($conductingRaw === null ? null : (string) $conductingRaw);
+            $icon = $this->cleanString($row['icon'] ?? null);
 
             if (empty($fullNameByLocale)) {
                 // full_name didn't decode into a locale map (missing, or a
@@ -89,10 +91,11 @@ class BigQueryExamSyncService
                 'uid' => $uid,
                 'label' => $label,
                 'key' => $slug,
-                'attrs' => ['exam_slug' => $slug],
+                'attrs' => ['exam_slug' => $slug, 'icon' => $icon],
                 'hash' => $this->hashOf([
                     'uid' => $uid,
                     'exam_slug' => $slug,
+                    'icon' => $icon,
                     'short_name' => $shortName,
                     'full_name' => $fullNameByLocale,
                     'conducting_body' => $conductingBodyByLocale,

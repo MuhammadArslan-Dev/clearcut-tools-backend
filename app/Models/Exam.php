@@ -7,11 +7,14 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Exam extends Model
 {
-    // short_name/full_name/conducting_body live in exam_translations.
+    // short_name/full_name/conducting_body live in exam_translations;
+    // icon isn't text so it stays here, identical across every locale
+    // (same reasoning as ToolCategory::$fillable).
     protected $fillable = [
         'uid',
         'content_hash',
         'exam_slug',
+        'icon',
     ];
 
     public function toolExams(): HasMany
