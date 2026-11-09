@@ -49,6 +49,10 @@ class ToolExamResource extends JsonResource
                         'format' => $d->format,
                         'required' => $d->is_required,
                         'verification' => $d->verification,
+                        // Where the spec was checked and when — the page
+                        // shows "Verified against [link] on [date]" (CC-159).
+                        'sourceUrl' => $d->source_url,
+                        'verifiedOn' => $d->verified_on?->toDateString(),
                     ])
                     ->all()),
             ]),
